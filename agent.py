@@ -79,28 +79,23 @@ class DQNTrainingAgent(TorchTrainingOffline):
         self.optimizer.step()
         self.updates_done += 1
         
-        # Log metrics every update
         loss_val = loss.item()
         avg_rew = reward.mean().item()
         
         csv_path = "training_metrics.csv"
         
-        # Check if file exists, if not create with header
         if not os.path.isfile(csv_path):
             with open(csv_path, mode='w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["Step", "Loss", "Avg_Reward"])
         
-        # Append metrics to CSV
         with open(csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([self.updates_done, loss_val, avg_rew])
         
-        print(f"[TRAIN] Step: {self.updates_done} | Loss: {loss_val:.6f} | Avg_Reward: {avg_rew:.6f}")
 
         if self.updates_done % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
-            print(f"[UPDATE] Target network updated at step {self.updates_done}")
             
         return {"loss": loss_val}
 
