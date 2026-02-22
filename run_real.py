@@ -9,12 +9,9 @@ import gymnasium as gym
 
 from cnn import TrackmaniaCNN
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda")
 
 class TM2020DiscreteWrapper(gym.Wrapper):
-    """
-    Wrapper, który tłumaczy świat rzeczywisty gry na warunki twojego uproszczonego DQN.
-    """
     def __init__(self, env):
         super().__init__(env)
         self.action_space = gym.spaces.Discrete(4)
