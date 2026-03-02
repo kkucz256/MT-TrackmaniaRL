@@ -18,7 +18,7 @@ def test_inference(num_episodes=5, max_steps=1000):
     model.eval()
     
     try:
-        model.load_state_dict(torch.load("model_weights.pt", weights_only=True))
+        model.load_state_dict(torch.load("model_nd.pt", weights_only=True))
         print("Model załadowany z model_weights.pt")
     except FileNotFoundError:
         print("BŁĄD: model_weights.pt nie znaleziony!")

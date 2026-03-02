@@ -29,6 +29,12 @@ TARGET_UPDATE = 5
 EPS_START = 1.0
 EPS_END = 0.05
 EPS_DECAY = 10000
+EPS_START_RESUMED = 0.15  # Niższy epsilon dla wznowienia - głównie eksploatacja, mała eksploracja
+
+RESUME_TRAINING = False  # True = wznowić z istniejącego modelu, False = trening od nowa
+MODEL_INITIAL_NAME = "model_pon.pt" 
+MODEL_RESUMED_NAME = "model_nd_resumed.pt"
+MODEL_CHECKPOINT_NAME = MODEL_RESUMED_NAME if RESUME_TRAINING else MODEL_INITIAL_NAME
 
 print(f"""
 {'='*70}
@@ -41,6 +47,13 @@ Hiperparametry:
 - Memory Size: {MEMORY_SIZE}
 - Target Update: {TARGET_UPDATE}
 - EPS Decay: {EPS_DECAY}
+- EPS Start (od nowa): {EPS_START}
+- EPS Start (wznowienie): {EPS_START_RESUMED}
+- EPS End: {EPS_END}
+- Resume Training: {RESUME_TRAINING}
+- Model Initial: {MODEL_INITIAL_NAME}
+- Model Resumed: {MODEL_RESUMED_NAME}
+- Model Checkpoint: {MODEL_CHECKPOINT_NAME}
 {'='*70}
 """)
 
@@ -69,13 +82,21 @@ def collector_worker(experience_queue, run_flag):
         print("[KOLEKTOR] Gotowy, zaczynam zbierać doświadczenia...\n")
         
         while run_flag.value == 1:
-            if steps > 0 and steps % 150 == 0 and os.path.exists("model_weights.pt"):
-                try:
-                    model.load_state_dict(torch.load("model_weights.pt", weights_only=True))
-                except Exception as e:
-                    print(f"[KOLEKTOR] Błąd ładowania: {e}")
+            if steps > 0 and steps % 150 == 0:
+                # Spróbuj wczytać model z preferowanej ścieżki, następnie fallback
+                model_path = None
+                if RESUME_TRAINING and os.path.exists(MODEL_RESUMED_NAME):
+                    model_path = MODEL_RESUMED_NAME
+                elif os.path.exists(MODEL_INITIAL_NAME):
+                    model_path = MODEL_INITIAL_NAME
+                
+                if model_path:
+                    try:
+                        model.load_state_dict(torch.load(model_path, weights_only=True))
+                    except Exception as e:
+                        print(f"[KOLEKTOR] Błąd ładowania: {e}")
 
-            epsilon = EPS_END + (EPS_START - EPS_END) * np.exp(-1. * steps / EPS_DECAY)
+            epsilon = EPS_END + (EPS_START_RESUMED - EPS_END) * np.exp(-1. * steps / EPS_DECAY) if RESUME_TRAINING else EPS_END + (EPS_START - EPS_END) * np.exp(-1. * steps / EPS_DECAY)
             
             if random.random() < epsilon:
                 action = env.action_space.sample()
@@ -154,6 +175,17 @@ def learner_worker(experience_queue, run_flag):
         tmp_env = TrackmaniaEnv()
         policy_net = TrackmaniaNet(tmp_env.observation_space, tmp_env.action_space).cuda()
         target_net = TrackmaniaNet(tmp_env.observation_space, tmp_env.action_space).cuda()
+        
+        # Wczytaj model jeśli wznowienie treningu
+        if RESUME_TRAINING and os.path.exists(MODEL_RESUMED_NAME):
+            print(f"[TRENER] Wznowienie treningu - ładuję {MODEL_RESUMED_NAME}...")
+            policy_net.load_state_dict(torch.load(MODEL_RESUMED_NAME, weights_only=True))
+        elif RESUME_TRAINING and os.path.exists(MODEL_INITIAL_NAME):
+            print(f"[TRENER] Wznowienie treningu - {MODEL_RESUMED_NAME} nie znaleziony, ładuję {MODEL_INITIAL_NAME}...")
+            policy_net.load_state_dict(torch.load(MODEL_INITIAL_NAME, weights_only=True))
+        else:
+            print("[TRENER] Trening od nowa - inicjalizuję nowy model.")
+        
         target_net.load_state_dict(policy_net.state_dict())
         target_net.eval()
         tmp_env.close()
@@ -216,7 +248,7 @@ def learner_worker(experience_queue, run_flag):
                                 csv_writer = csv.writer(csv_file_handle)
                                 csv_writer.writerow(['Timestamp', 'Batch', 'Loss', 'Avg_Reward', 'Buffer_Size', 'Epsilon'])
                             
-                            eps = EPS_END + (EPS_START - EPS_END) * np.exp(-1. * batches_done / EPS_DECAY)
+                            eps = EPS_END + (EPS_START_RESUMED - EPS_END) * np.exp(-1. * batches_done / EPS_DECAY) if RESUME_TRAINING else EPS_END + (EPS_START - EPS_END) * np.exp(-1. * batches_done / EPS_DECAY)
                             csv_writer.writerow([timestamp, batches_done, f"{loss.item():.4f}", f"{avg_reward:.4f}", len(memory), f"{eps:.4f}"])
                             csv_file_handle.flush()
                         except Exception as e:
@@ -225,8 +257,8 @@ def learner_worker(experience_queue, run_flag):
                     if batches_done % TARGET_UPDATE == 0:
                         target_net.load_state_dict(policy_net.state_dict())
                         try:
-                            torch.save(policy_net.state_dict(), "model_weights.pt")
-                            file_size = os.path.getsize("model_weights.pt") / (1024*1024)
+                            torch.save(policy_net.state_dict(), MODEL_CHECKPOINT_NAME)
+                            file_size = os.path.getsize(MODEL_CHECKPOINT_NAME) / (1024*1024)
                             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
                             print(f"\n>>> [CHECKPOINT {timestamp}] Batch: {batches_done} | Loss: {loss.item():.4f} | Size: {file_size:.2f}MB <<<\n")
                             
