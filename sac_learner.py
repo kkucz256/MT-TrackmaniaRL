@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-SAC LEARNER DLA TRACKMANII - DECOUPLED ARCHITECTURE
-3 PROCESY: COLLECTOR + TRAINER (SAC) + Dashboard
-Używa: stable-baselines3.SAC + TMRL pipeline + CNN
-"""
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -15,8 +9,6 @@ import torch
 import torch.nn as nn
 import random
 import os
-import cv2
-import datetime
 import sys
 from collections import deque
 
@@ -33,9 +25,10 @@ TRAIN_BATCH_THRESHOLD = 16
 MEMORY_SIZE = 10000 
 TAU = 0.005
 AUTO_ENTROPY = True
+WARMUP_STEPS = 2000
 
 RESUME_TRAINING = False
-MODEL_NAME = "sac_model"
+MODEL_NAME = "sac_model_new"
 MODEL_CHECKPOINT_DIR = "./models"
 
 os.makedirs(MODEL_CHECKPOINT_DIR, exist_ok=True)
@@ -54,10 +47,10 @@ def collector_worker(experience_queue, run_flag):
         
         if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
             print(f"[COLLECTOR] Loading model: {model_path}")
-            actor = TmrlSacActorModule(env.observation_space, (9,), device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
+            actor = TmrlSacActorModule(env.observation_space, env.action_space, device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
         else:
             print(f"[COLLECTOR] Creating new actor")
-            actor = TmrlSacActorModule(env.observation_space, (9,), device="cuda", buffer_size=MEMORY_SIZE)
+            actor = TmrlSacActorModule(env.observation_space, env.action_space, device="cuda", buffer_size=MEMORY_SIZE)
         
         print("[COLLECTOR] Ready, collecting experiences")
         
@@ -67,9 +60,13 @@ def collector_worker(experience_queue, run_flag):
         last_log = time.time()
         
         while run_flag.value == 1:
-            # Inference - act() obsługuje dict observation bezpośrednio
-            action_tensor = actor.act(obs, test=False)
-            action = action_tensor.cpu().numpy().flatten()
+            if steps < WARMUP_STEPS:
+                # Warmup phase: random actions
+                action = env.action_space.sample()
+            else:
+                # Policy phase: model actions
+                action_tensor = actor.act(obs, test=False)
+                action = action_tensor.cpu().numpy().flatten()
             
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
@@ -111,20 +108,22 @@ def learner_worker(experience_queue, run_flag):
     tb_writer = SummaryWriter(log_dir="./logs/learner")
     
     try:
-        env = TrackmaniaEnv()
+        observation_space = spaces.Dict({
+            "vision": spaces.Box(low=0, high=255, shape=(128, 128, 3), dtype=np.uint8),
+            "telemetry": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+        })
+        action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
         model_path = os.path.join(MODEL_CHECKPOINT_DIR, MODEL_NAME)
         
         if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
             print(f"[TRAINER] Loading model: {model_path}")
-            training_agent = TmrlSacTrainingAgent(env.observation_space, (9,), device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
+            training_agent = TmrlSacTrainingAgent(observation_space, action_space, device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
         else:
             print(f"[TRAINER] Creating new training agent")
-            training_agent = TmrlSacTrainingAgent(env.observation_space, (9,), device="cuda", buffer_size=MEMORY_SIZE)
+            training_agent = TmrlSacTrainingAgent(observation_space, action_space, device="cuda", buffer_size=MEMORY_SIZE)
         
         print("[TRAINER] Ready")
-        print("[TRAINER] RELOAD PLUGIN")
-        env.close()
         
         memory = deque(maxlen=MEMORY_SIZE)
         batches_done = 0
@@ -178,44 +177,7 @@ def learner_worker(experience_queue, run_flag):
         tb_writer.close()
         print("[TRAINER] Closed.")
 
-def dashboard_worker(experience_queue_peek, run_flag):
-    print("[DASHBOARD] Starting reward monitor...")
-    
-    recent_rewards = deque(maxlen=50)
-    
-    while run_flag.value == 1:
-        try:
-            if not experience_queue_peek.empty():
-                try:
-                    exp = experience_queue_peek.get_nowait()
-                    reward = exp[2]
-                    recent_rewards.append(reward)
-                    
-                    display_frame = np.zeros((300, 500, 3), dtype=np.uint8)
-                    
-                    color = (0, 255, 0) if reward > 0 else (0, 0, 255)
-                    cv2.putText(display_frame, f"Reward: {reward:.4f}", (50, 100), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
-                    
-                    avg_rew = np.mean(recent_rewards) if recent_rewards else 0
-                    cv2.putText(display_frame, f"Avg(50): {avg_rew:.4f}", (50, 180), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
-                    
-                    cv2.putText(display_frame, f"Samples: {len(recent_rewards)}", (50, 240), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-                    
-                    cv2.imshow("SAC Training - Rewards", display_frame)
-                except:
-                    pass
-            
-            if cv2.waitKey(30) & 0xFF == ord('q'):
-                break
-                
-        except Exception as e:
-            continue
-    
-    cv2.destroyAllWindows()
-    print("[DASHBOARD] Closed")
+
 
 if __name__ == "__main__":
     print("\n" + "="*80)
@@ -229,19 +191,15 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     
     exp_queue = mp.Queue(maxsize=2000)
-    exp_queue_peek = mp.Queue(maxsize=100)
     run_flag = mp.Value('i', 1)
     
     p_learner = mp.Process(target=learner_worker, args=(exp_queue, run_flag), daemon=False)
     p_collector = mp.Process(target=collector_worker, args=(exp_queue, run_flag), daemon=False)
-    p_dashboard = mp.Process(target=dashboard_worker, args=(exp_queue_peek, run_flag), daemon=True)
     
     try:
         p_learner.start()
         time.sleep(1)
         p_collector.start()
-        time.sleep(1)
-        p_dashboard.start()
         
         while True:
             time.sleep(1)
@@ -251,7 +209,7 @@ if __name__ == "__main__":
     finally:
         run_flag.value = 0
         
-        for proc in [p_collector, p_learner, p_dashboard]:
+        for proc in [p_collector, p_learner]:
             try:
                 proc.join(timeout=3)
                 if proc.is_alive():

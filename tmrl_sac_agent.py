@@ -89,10 +89,15 @@ class TmrlSacActorModule(TorchActorModule):
                 else:
                     self.obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(observation_space,), dtype=np.float32)
             
-            if isinstance(action_shape, int):
+            # Handle action space - can be Box or tuple/int
+            if isinstance(action_shape, spaces.Box):
+                self.action_space = action_shape
+            elif isinstance(action_shape, int):
                 self.action_space = spaces.Box(low=-1, high=1, shape=(action_shape,), dtype=np.float32)
-            else:
+            elif isinstance(action_shape, tuple):
                 self.action_space = spaces.Box(low=-1, high=1, shape=action_shape, dtype=np.float32)
+            else:
+                self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)  # Default fallback
             
             self.sac_model = None
             

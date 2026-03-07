@@ -34,7 +34,7 @@ class TrackmaniaEnv(gym.Env):
             self.kdtree = KDTree(self.track_points)
             self.last_track_index = 0
 
-        self.action_space = spaces.Discrete(9)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
         self.observation_space = spaces.Dict({
             "vision": spaces.Box(low=0, high=255, shape=(128, 128, 3), dtype=np.uint8),
@@ -70,42 +70,23 @@ class TrackmaniaEnv(gym.Env):
         return float(total_reward), dist
 
     def step(self, action):
-        # Konwertuj action do int jeśli jest array
-        # SAC zwraca [-1, 1] continuous, mapuj na [0, 8] discrete
-        if isinstance(action, np.ndarray):
-            continuous_action = float(action[0]) if action.size > 0 else 0.0
-        else:
-            continuous_action = float(action)
+        # Handle continuous action: [steering, throttle/brake]
+        # steering: [-1, 1] left to right
+        # throttle/brake: [-1, 1] where >0 is gas, <0 is brake
         
-        # Map [-1, 1] → [0, 8]
-        action = int(np.clip((continuous_action + 1.0) / 2.0 * 8.0, 0, 8))
-
-        steering = 0.0
-        throttle = 0.0
-        brake = 0.0
-        if action == 0:
-            pass 
-        elif action == 1:
-            steering = -1.0
-        elif action == 2:
-            steering = 1.0
-        elif action == 3:
-            throttle = 1.0
-        elif action == 4:
-            brake = 1.0
-        elif action == 5:
-            steering = -1.0
-            throttle = 1.0
-        elif action == 6:
-            steering = 1.0
-            throttle = 1.0
-        elif action == 7:
-            steering = -1.0
-            brake = 1.0
-        elif action == 8:
-            steering = 1.0
-            brake = 1.0
-
+        if isinstance(action, np.ndarray):
+            steering = float(np.clip(action[0], -1.0, 1.0))
+            throttle_brake = float(np.clip(action[1], -1.0, 1.0))
+        else:
+            steering = 0.0
+            throttle_brake = 0.0
+        
+        # Throttle: if positive
+        throttle = max(0.0, throttle_brake)
+        # Brake: if negative (flip to positive)
+        brake = max(0.0, -throttle_brake)
+        
+        # Map to gamepad
         x_joystick = int(steering * 32767)
         self.gamepad.left_joystick(x_value=x_joystick, y_value=0)
         self.gamepad.right_trigger(value=int(throttle * 255))
