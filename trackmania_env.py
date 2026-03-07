@@ -6,13 +6,14 @@ import time
 import cv2
 import pandas as pd
 from scipy.spatial import KDTree
+import os
 
 from pipeline import TrackmaniaPipeline 
 
 class TrackmaniaEnv(gym.Env):
     def __init__(self):
         super().__init__()
-        print("Inicjalizacja środowiska RL. Uruchamiam potok...")
+        
         self.pipeline = TrackmaniaPipeline()
         
         self.gamepad = vg.VX360Gamepad()
@@ -22,14 +23,13 @@ class TrackmaniaEnv(gym.Env):
         self.pause_threshold = 10
         
         try:
-            print("Wczytuję linię idealną z track_points.csv...")
-            df = pd.read_csv("track_points.csv", header=None)
+            track_points_path = os.path.join(os.getcwd(), "trackpoints", "track_points_training01.csv")
+            df = pd.read_csv(track_points_path, header=None)
             self.track_points = df.values
             self.kdtree = KDTree(self.track_points)
             self.last_track_index = 0
-            print(f"Załadowano {len(self.track_points)} punktów trasy.")
         except Exception as e:
-            print(f"BŁĄD: Nie można wczytać trasy: {e}")
+            print(f"[TrackmaniaEnv] Warning: Could not load track points from {track_points_path}: {e}")
             self.track_points = np.zeros((1, 3))
             self.kdtree = KDTree(self.track_points)
             self.last_track_index = 0
@@ -70,6 +70,15 @@ class TrackmaniaEnv(gym.Env):
         return float(total_reward), dist
 
     def step(self, action):
+        # Konwertuj action do int jeśli jest array
+        # SAC zwraca [-1, 1] continuous, mapuj na [0, 8] discrete
+        if isinstance(action, np.ndarray):
+            continuous_action = float(action[0]) if action.size > 0 else 0.0
+        else:
+            continuous_action = float(action)
+        
+        # Map [-1, 1] → [0, 8]
+        action = int(np.clip((continuous_action + 1.0) / 2.0 * 8.0, 0, 8))
 
         steering = 0.0
         throttle = 0.0

@@ -9,65 +9,105 @@ import win32gui
 def get_trackmania_window():
     hwnd = win32gui.FindWindow(None, "Trackmania")
     if not hwnd:
-        print("BŁĄD: Nie znaleziono okna Trackmanii! Upewnij się, że gra jest włączona.")
-        return None
-    return win32gui.GetWindowRect(hwnd)
+        for window_name in ["TrackMania", "Trackmania 2020", "tm2020", "TM2020"]:
+            hwnd = win32gui.FindWindow(None, window_name)
+            if hwnd:
+                break
+        
+        if not hwnd:
+            return None
+    
+    rect = win32gui.GetWindowRect(hwnd)
+    return rect
 
 class TrackmaniaPipeline:
+    _instance_count = 0
+    _lock = threading.Lock()
+    
     def __init__(self, tcp_ip="0.0.0.0", tcp_port=9000):
+        
+        with TrackmaniaPipeline._lock:
+            TrackmaniaPipeline._instance_count += 1
+            instance_id = TrackmaniaPipeline._instance_count
+        
         self.running = True
         self.latest_telemetry = {}
+        self.instance_id = instance_id
         
         window_rect = get_trackmania_window()
+        
         if window_rect:
             left, top, right, bottom = window_rect
-            print(f"Znaleziono okno gry. Region przechwytywania: {window_rect}")
             
             if left < 0 or top < 0:
-                print("UWAGA: Okno poza głównym ekranem! Przechwytywanie całego ekranu...")
                 self.camera = bettercam.create(output_color="BGR")
             else:
                 self.camera = bettercam.create(region=window_rect, output_color="BGR")
         else:
-            self.camera = bettercam.create(output_color="BGR") 
+            self.camera = bettercam.create(output_color="BGR")
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((tcp_ip, tcp_port))
+        
+        # Retry bind if port is in use
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.sock.bind((tcp_ip, tcp_port))
+                break
+            except OSError as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+        
         self.sock.listen(1)
         
-        print(f"--- Nasłuchuję TCP na porcie {tcp_port}. Przeładuj plugin w OpenPlanet! ---")
-        self.conn, self.addr = self.sock.accept()
-        self.conn.settimeout(5.0)
-        print(f"POŁĄCZONO Z GRĄ: {self.addr}")
-
+        try:
+            self.conn, self.addr = self.sock.accept()
+            self.conn.settimeout(5.0)
+        except Exception as e:
+            raise
+        
         self.thread = threading.Thread(target=self._tcp_worker, daemon=True)
         self.thread.start()
 
     def _tcp_worker(self):
         buffer = ""
+        
         while self.running:
             try:
                 try:
+                    if self.conn is None:
+                        time.sleep(0.5)
+                        continue
                     data = self.conn.recv(4096)
                 except socket.timeout:
-                    time.sleep(0.5)
+                    continue
+                except (OSError, socket.error) as e:
+                    if self.running:
+                        time.sleep(0.2)
                     continue
                 
                 if not data:
-                    print("Zerwano połączenie TCP.")
-                    break
+                    if self.running:
+                        pass
+                    time.sleep(1.0)
+                    continue
                 
-                buffer += data.decode('utf-8')
-                
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-                    if line:
-                        self.latest_telemetry = json.loads(line)
+                try:
+                    buffer += data.decode('utf-8', errors='ignore')
+                    
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line:
+                            self.latest_telemetry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as decode_err:
+                    continue
             except Exception as e:
-                print(f"Błąd w wątku TCP: {e}")
-                time.sleep(0.5)
+                if self.running:
+                    time.sleep(0.2)
 
     def get_state(self):
         frame = self.camera.grab()
@@ -75,15 +115,14 @@ class TrackmaniaPipeline:
         if frame is not None:
             height, width, _ = frame.shape
             
-            crop_top = int(height * 0.40)     # Ucinamy górne 40% ekranu
-            crop_bottom = int(height * 0.85)  # Ucinamy dolne 15% ekranu
+            crop_top = int(height * 0.40)
+            crop_bottom = int(height * 0.85)
             
             frame_cropped = frame[crop_top:crop_bottom, :]
-            
             frame_resized = cv2.resize(frame_cropped, (128, 128))
             
             return frame_resized, self.latest_telemetry
-            
+        
         return None, self.latest_telemetry
 
     def stop(self):

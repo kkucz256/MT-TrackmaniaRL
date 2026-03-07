@@ -1,0 +1,12 @@
+torch==2.0.1
+numpy>=1.23.0
+stable-baselines3==2.0.0
+gymnasium==0.28.1
+tmrl-rl>=0.4.0
+opencv-python==4.8.1.78
+pandas>=2.0.0
+scipy==1.11.2
+vgamepad==0.0.8
+bettercam==0.2.0
+pywin32>=306
+

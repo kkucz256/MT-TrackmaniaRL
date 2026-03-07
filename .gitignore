@@ -1,0 +1,13 @@
+*.pyc
+__pycache__/
+*.egg-info/
+.Python
+*.pyo
+*.pyd
+logs/
+models/
+plan.md
+plan_*.md
+*.log
+events.out.tfevents*
+debug.log
