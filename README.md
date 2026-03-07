@@ -1,18 +1,18 @@
 # Trackmania
 
-Wszystkie użyte biblioteki
+All required libraries
 ```bash
 pip install -r requirements.txt
 ```
-Folder RL_Telemetry należy umieścić w folderze Plugins w OpenPlanet
+Place the RL_Telemetry folder in the Plugins folder in OpenPlanet
 
-Po zainicjowaniu środowiska Trackmania na docelowym torze, zweryfikuj czy działa nasłuch na porcie TCP:9000. Uruchom architekturę uczącą algorytmu SAC, wywołując poniższe polecenie:
+After initializing the Trackmania environment on your target track, verify that TCP port 9000 listening is working. Run the SAC algorithm training architecture with the following command:
 
 ```bash
 python sac_learner.py
 ```
 
-Hiperparametry modelu podlegają modyfikacji bezpośrednio w skrypcie wykonawczym. Wizualizację metryk treningowych w czasie rzeczywistym obsługuje TensorBoard, który zainicjujesz komendą:
+Model hyperparameters can be modified directly in the execution script. TensorBoard handles real-time training metrics visualization, initialized with:
 
 ```bash
 tensorboard --logdir ./logs

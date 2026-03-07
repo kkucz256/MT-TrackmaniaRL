@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 SAC LEARNER DLA TRACKMANII - DECOUPLED ARCHITECTURE
-3 PROCESY: Kolektor + Trener (SAC) + Dashboard
-Używa: stable-baselines3.SAC + TMRL pipeline
+3 PROCESY: COLLECTOR + TRAINER (SAC) + Dashboard
+Używa: stable-baselines3.SAC + TMRL pipeline + CNN
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -26,77 +26,40 @@ from gymnasium import spaces
 from gymnasium.core import Wrapper
 from torch.utils.tensorboard import SummaryWriter
 
-class DictToArrayWrapper(Wrapper):
-    """Konwertuje dict observations z TrackmaniaEnv na single flattened array"""
-    def __init__(self, env):
-        super().__init__(env)
-        
-        # Nowa observation space - konkatenacja vision (flattened) + telemetry
-        vision_shape = env.observation_space["vision"].shape  # (128, 128, 3)
-        vision_flat = int(np.prod(vision_shape))  # 128*128*3 = 49152
-        tele_shape = env.observation_space["telemetry"].shape  # (7,)
-        
-        total_size = vision_flat + tele_shape[0]
-        self.observation_space = spaces.Box(low=0, high=255, shape=(total_size,), dtype=np.float32)
-        
-        self.vision_shape = vision_shape
-        self.vision_flat_size = vision_flat
-        
-    def _format_obs(self, obs_dict):
-        """Konwertuje dict observation na single array"""
-        if isinstance(obs_dict, dict):
-            vision = obs_dict["vision"].astype(np.float32).flatten() / 255.0  # Normalize
-            telemetry = obs_dict["telemetry"].astype(np.float32)
-            return np.concatenate([vision, telemetry])
-        return obs_dict
-    
-    def reset(self, **kwargs):
-        obs_dict, info = self.env.reset(**kwargs)
-        return self._format_obs(obs_dict), info
-    
-    def step(self, action):
-        obs_dict, reward, terminated, truncated, info = self.env.step(action)
-        return self._format_obs(obs_dict), reward, terminated, truncated, info
-
-# === HIPERPARAMETRY SAC ===
 GAMMA = 0.99
 LEARNING_RATE = 3e-4
-BATCH_SIZE = 64  # Zmniejszony z 256
-TRAIN_BATCH_THRESHOLD = 16  # Minimum doświadczeń do trenowania
-MEMORY_SIZE = 10000  # Zmniejszony z 100000 aby zmieścić się w RAM
-TAU = 0.005  # Target network update rate
-AUTO_ENTROPY = True  # Automatic entropy tuning
+BATCH_SIZE = 64
+TRAIN_BATCH_THRESHOLD = 16
+MEMORY_SIZE = 10000 
+TAU = 0.005
+AUTO_ENTROPY = True
 
-# Model checkpoint
 RESUME_TRAINING = False
 MODEL_NAME = "sac_model"
 MODEL_CHECKPOINT_DIR = "./models"
 
-# Utwórz folder models jeśli nie istnieje
 os.makedirs(MODEL_CHECKPOINT_DIR, exist_ok=True)
 
 def collector_worker(experience_queue, run_flag):
-    """PROCES 1: KOLEKTOR - Zbiera doświadczenia"""
-    print("[KOLEKTOR] Starting...")
+    print("[COLLECTOR] Starting...")
     
     tb_writer = SummaryWriter(log_dir="./logs/collector")
     env = None
     
     try:
-        time.sleep(3)  # Wait for TRENER TCP
+        time.sleep(3)
         env = TrackmaniaEnv()
-        env = DictToArrayWrapper(env)
         
         model_path = os.path.join(MODEL_CHECKPOINT_DIR, MODEL_NAME)
         
         if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
-            print(f"[KOLEKTOR] Loading model: {model_path}")
-            actor = TmrlSacActorModule((49159,), (9,), device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
+            print(f"[COLLECTOR] Loading model: {model_path}")
+            actor = TmrlSacActorModule(env.observation_space, (9,), device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
         else:
-            print(f"[KOLEKTOR] Creating new actor")
-            actor = TmrlSacActorModule((49159,), (9,), device="cuda", buffer_size=MEMORY_SIZE)
+            print(f"[COLLECTOR] Creating new actor")
+            actor = TmrlSacActorModule(env.observation_space, (9,), device="cuda", buffer_size=MEMORY_SIZE)
         
-        print("[KOLEKTOR] Ready, collecting experiences")
+        print("[COLLECTOR] Ready, collecting experiences")
         
         obs, _ = env.reset()
         steps = 0
@@ -104,8 +67,8 @@ def collector_worker(experience_queue, run_flag):
         last_log = time.time()
         
         while run_flag.value == 1:
-            obs_tensor = torch.tensor(obs, dtype=torch.float32, device="cuda").unsqueeze(0)
-            action_tensor = actor.act(obs_tensor, test=False)
+            # Inference - act() obsługuje dict observation bezpośrednio
+            action_tensor = actor.act(obs, test=False)
             action = action_tensor.cpu().numpy().flatten()
             
             next_obs, reward, terminated, truncated, info = env.step(action)
@@ -120,10 +83,10 @@ def collector_worker(experience_queue, run_flag):
                 
                 if time.time() - last_log >= 5.0:
                     avg_rew = np.mean(episode_rewards[-50:]) if episode_rewards else 0
-                    print(f"[KOLEKTOR] Steps: {steps:6d} | Reward: {avg_rew:.4f}")
+                    print(f"[COLLECTOR] Steps: {steps:6d} | Reward: {avg_rew:.4f}")
                     tb_writer.add_scalar('Collector/Avg_Reward_50', avg_rew, steps)
                     tb_writer.add_scalar('Collector/Total_Steps', steps, steps)
-                    tb_writer.flush()  # Flush na każdy log
+                    tb_writer.flush()
                     last_log = time.time()
                     
             except mp.queues.Full:
@@ -134,35 +97,33 @@ def collector_worker(experience_queue, run_flag):
                 obs, _ = env.reset()
         
     except Exception as e:
-        print(f"[KOLEKTOR] ERROR: {e}")
+        print(f"[COLLECTOR] ERROR: {e}")
     finally:
         tb_writer.flush()
         tb_writer.close()
         if env:
             env.close()
-        print("[KOLEKTOR] Zamknięty.")
+        print("[COLLECTOR] Closed.")
 
 def learner_worker(experience_queue, run_flag):
-    """PROCES 2: TRENER - Trenuje model SAC"""
-    print("[TRENER] Starting...")
+    print("[TRAINER] Starting...")
     
     tb_writer = SummaryWriter(log_dir="./logs/learner")
     
     try:
         env = TrackmaniaEnv()
-        env = DictToArrayWrapper(env)
         
         model_path = os.path.join(MODEL_CHECKPOINT_DIR, MODEL_NAME)
         
         if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
-            print(f"[TRENER] Loading model: {model_path}")
-            training_agent = TmrlSacTrainingAgent.load(model_path, device="cuda")
+            print(f"[TRAINER] Loading model: {model_path}")
+            training_agent = TmrlSacTrainingAgent(env.observation_space, (9,), device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
         else:
-            print(f"[TRENER] Creating new training agent")
-            training_agent = TmrlSacTrainingAgent((49159,), (9,), device="cuda", buffer_size=MEMORY_SIZE)
+            print(f"[TRAINER] Creating new training agent")
+            training_agent = TmrlSacTrainingAgent(env.observation_space, (9,), device="cuda", buffer_size=MEMORY_SIZE)
         
-        print("[TRENER] Ready")
-        print("[TRENER] RELOAD PLUGIN")
+        print("[TRAINER] Ready")
+        print("[TRAINER] RELOAD PLUGIN")
         env.close()
         
         memory = deque(maxlen=MEMORY_SIZE)
@@ -171,7 +132,6 @@ def learner_worker(experience_queue, run_flag):
         
         while run_flag.value == 1:
             try:
-                # Collect experiences
                 experiences_batch = []
                 try:
                     for _ in range(min(10, BATCH_SIZE)):
@@ -188,7 +148,7 @@ def learner_worker(experience_queue, run_flag):
                         
                         if time.time() - last_log_time >= 2.0:
                             avg_reward = np.mean([exp[2] for exp in list(memory)[-min(100, len(memory)):]]) if memory else 0
-                            print(f"[TRENER] Batch: {batches_done:5d} | Reward: {avg_reward:.4f} | Buffer: {len(memory)}")
+                            print(f"[TRAINER] Batch: {batches_done:5d} | Reward: {avg_reward:.4f} | Buffer: {len(memory)}")
                             tb_writer.add_scalar('Learner/Avg_Reward_100', avg_reward, batches_done)
                             tb_writer.add_scalar('Learner/Buffer_Size', len(memory), batches_done)
                             tb_writer.add_scalar('Learner/Batches_Done', batches_done, batches_done)
@@ -197,29 +157,28 @@ def learner_worker(experience_queue, run_flag):
                         
                         if batches_done % 10 == 0:
                             training_agent.save(model_path)
-                            print(f"[TRENER] CHECKPOINT batch {batches_done}")
+                            print(f"[TRAINER] CHECKPOINT batch {batches_done}")
                     
                     except Exception as e:
-                        print(f"[TRENER] Train error: {e}")
+                        print(f"[TRAINER] Train error: {e}")
                 
             except Exception as e:
-                print(f"[TRENER] ERROR: {e}")
+                print(f"[TRAINER] ERROR: {e}")
                 break
         
         training_agent.save(model_path)
-        print(f"[TRENER] Final checkpoint saved")
+        print(f"[TRAINER] Final checkpoint saved")
 
     except Exception as e:
-        print(f"[TRENER] FATALNA INICJALIZACJA: {e}")
+        print(f"[TRAINER] FATAL INITIALIZATION: {e}")
         import traceback
         traceback.print_exc()
     finally:
         tb_writer.flush()
         tb_writer.close()
-        print("[TRENER] Zamknięty.")
+        print("[TRAINER] Closed.")
 
 def dashboard_worker(experience_queue_peek, run_flag):
-    """PROCES 3: DASHBOARD - Reward visualization"""
     print("[DASHBOARD] Starting reward monitor...")
     
     recent_rewards = deque(maxlen=50)
