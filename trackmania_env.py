@@ -52,25 +52,21 @@ class TrackmaniaEnv(gym.Env):
             progress_reward = -0.05
         
         if dist < 1.5:
-            track_bonus = 0.2
+            track_bonus = 0.5
         elif dist < 4.0:
-            track_bonus = 0.1
+            track_bonus = 0.2
         elif dist < 10.0:
             track_bonus = 0.0
         else:
             track_bonus = -0.2
         
-        # MUCH STRONGER speed bonus - encourage forward movement
         speed_bonus = 0.0
         if 25.0 <= current_speed <= 200.0:
-            speed_bonus = 1.5
-        elif 10.0 <= current_speed < 25.0:
-            speed_bonus = 0.5
+            speed_bonus = 0.3
         elif current_speed < 5.0:
-            speed_bonus = -1.0
+            speed_bonus = -0.05
             
         total_reward = progress_reward + track_bonus + speed_bonus
-        
         return float(total_reward), dist
 
     def step(self, action):
