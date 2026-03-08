@@ -3,7 +3,6 @@ import torch.nn as nn
 from stable_baselines3 import SAC
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from torch.utils.tensorboard import SummaryWriter
 from tmrl.actor import TorchActorModule
 from tmrl.training import TrainingAgent
 from gymnasium import spaces
@@ -146,6 +145,7 @@ class TmrlSacActorModule(TorchActorModule):
                 learning_rate=3e-4,
                 gamma=0.99,
                 tau=0.005,
+                ent_coef=0.1,  # Balanced entropy
                 buffer_size=self.buffer_size,
                 batch_size=64,
                 policy_kwargs=policy_kwargs,
@@ -153,7 +153,11 @@ class TmrlSacActorModule(TorchActorModule):
                 verbose=0
             )
             
-            self.sac_model.set_logger(configure(folder=None, format_strings=[]))
+            # Ustawiamy logger, ale nie wyłączamy go - SB3 będzie zbierać metryki
+            from stable_baselines3.common.logger import Logger
+            self.sac_model.set_logger(Logger(folder=None, output_formats=[]))
+            
+            self.sac_model.set_logger(configure(folder=None, format_strings=["log"]))
             
             params = sum(p.numel() for p in self.sac_model.policy.parameters())
             print(f"[Actor] Created SAC with {params:,} parameters")
@@ -167,7 +171,7 @@ class TmrlSacActorModule(TorchActorModule):
     def _load_sac_model(self, path, device):
         try:
             self.sac_model = SAC.load(path, env=None, device=device)
-            self.sac_model.set_logger(configure(folder=None, format_strings=[]))
+            self.sac_model.set_logger(configure(folder=None, format_strings=["log"]))
         except Exception as e:
             print(f"[Actor] Load failed: {e}")
             raise
@@ -199,7 +203,6 @@ class TmrlSacTrainingAgent(TrainingAgent):
     def __init__(self, observation_space, action_shape, device='cuda', model_path=None, buffer_size=10000):
         try:
             self.train_steps = 0
-            self.tb_writer = SummaryWriter(log_dir="./logs/trainer")
             
             self.actor_module = TmrlSacActorModule(observation_space, action_shape, device, model_path, buffer_size)
             
@@ -219,42 +222,50 @@ class TmrlSacTrainingAgent(TrainingAgent):
             
             for exp in batch:
                 try:
-                    obs, action, reward, next_obs, done = exp
+                    raw_obs, raw_action, raw_reward, raw_next_obs, raw_done = exp
+
+                    # Konwersja obs: Channel-Last (H,W,C) -> Channel-First (C,H,W) + batch dim
+                    vision = np.transpose(raw_obs["vision"], (2, 0, 1))
+                    vision = np.expand_dims(vision, axis=0)
+                    telemetry = np.expand_dims(raw_obs["telemetry"], axis=0)
+                    obs_fmt = {"vision": vision, "telemetry": telemetry}
+
+                    # Konwersja next_obs
+                    next_vision = np.transpose(raw_next_obs["vision"], (2, 0, 1))
+                    next_vision = np.expand_dims(next_vision, axis=0)
+                    next_telemetry = np.expand_dims(raw_next_obs["telemetry"], axis=0)
+                    next_obs_fmt = {"vision": next_vision, "telemetry": next_telemetry}
+
+                    # Konwersja action, reward, done
+                    action_fmt = np.expand_dims(raw_action, axis=0)
+                    reward_fmt = np.array([raw_reward], dtype=np.float32)
+                    done_fmt = np.array([raw_done], dtype=np.float32)
+
                     self.actor_module.sac_model.replay_buffer.add(
-                        obs=obs,
-                        action=action,
-                        reward=float(reward),
-                        next_obs=next_obs,
-                        done=done,
+                        obs=obs_fmt,
+                        action=action_fmt,
+                        reward=reward_fmt,
+                        next_obs=next_obs_fmt,
+                        done=done_fmt,
                         infos=[{}]
                     )
                 except Exception as e:
-                    pass
+                    print(f"[CRITICAL BUFFER ERROR]: {e}")
             
             if self.actor_module.sac_model.replay_buffer.pos > 0:
                 gradient_steps = max(1, min(len(batch) // 2, 10))
                 try:
                     self.actor_module.sac_model.train(gradient_steps=gradient_steps)
                 except Exception as e:
-                    pass
-            
-            if self.train_steps % 100 == 0:
-                try:
-                    buf_size = self.actor_module.sac_model.replay_buffer.pos
-                    self.tb_writer.add_scalar('Training/Buffer_Size', buf_size, self.train_steps)
-                    self.tb_writer.add_scalar('Training/Learning_Rate', 3e-4, self.train_steps)
-                    self.tb_writer.add_scalar('Training/Batch_Size', 64, self.train_steps)
-                except Exception as e:
-                    pass
+                    print(f"[CRITICAL TRAIN ERROR]: {e}")
             
             self.train_steps += 1
-        
+
         except Exception as e:
             print(f"[Trainer] Error: {e}")
     
     def save(self, path: str):
         self.actor_module.save(path)
-        self.tb_writer.flush()
     
     def load(self, path: str):
         self.actor_module.load(path)

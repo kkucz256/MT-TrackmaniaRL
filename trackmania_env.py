@@ -52,21 +52,25 @@ class TrackmaniaEnv(gym.Env):
             progress_reward = -0.05
         
         if dist < 1.5:
-            track_bonus = 0.5
-        elif dist < 4.0:
             track_bonus = 0.2
+        elif dist < 4.0:
+            track_bonus = 0.1
         elif dist < 10.0:
             track_bonus = 0.0
         else:
             track_bonus = -0.2
         
+        # MUCH STRONGER speed bonus - encourage forward movement
         speed_bonus = 0.0
         if 25.0 <= current_speed <= 200.0:
-            speed_bonus = 0.3
+            speed_bonus = 1.5
+        elif 10.0 <= current_speed < 25.0:
+            speed_bonus = 0.5
         elif current_speed < 5.0:
-            speed_bonus = -0.05
+            speed_bonus = -1.0
             
         total_reward = progress_reward + track_bonus + speed_bonus
+        
         return float(total_reward), dist
 
     def step(self, action):
@@ -106,11 +110,12 @@ class TrackmaniaEnv(gym.Env):
         is_finished = tele.get('is_finished', False)
         
         if is_finished:
-            print("[ENV] Meta")
+            print("[ENV] FINISH LINE - REWARD: +100.0")
             reward = 100.0
             terminated = True
         
         elif distance_to_line > 10.0:
+            print(f"[ENV] OFF-TRACK (dist: {distance_to_line:.2f}) - PENALTY: -0.3")
             reward = -0.3
             terminated = True
         
@@ -121,7 +126,7 @@ class TrackmaniaEnv(gym.Env):
                 if dist_from_last < 0.1:
                     self.pause_counter += 1
                     if self.pause_counter > self.pause_threshold:
-                        print("[PAUZA WYKRYTA] Gra się zawiesiła, resetuję...")
+                        print(f"[ENV] PAUSE DETECTED (pause_counter: {self.pause_counter}) - PENALTY: -0.2")
                         reward = -0.2
                         terminated = True
                         self.pause_counter = 0
@@ -140,6 +145,10 @@ class TrackmaniaEnv(gym.Env):
         self.last_track_index = 0
         self.pause_counter = 0
         
+        print("\n" + "="*60)
+        print("[RESET] New episode - resetting environment and respawning agent...")
+        print("="*60 + "\n")
+        
         for _ in range(2):
             self.gamepad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
             self.gamepad.update()
@@ -156,7 +165,7 @@ class TrackmaniaEnv(gym.Env):
         frame, tele = self.pipeline.get_state()
         
         if tele.get('is_finished', False):
-             print("[ENV WARN] Agent odrodził się z flagą is_finished. Złe UI?")
+             print("[ENV WARN] Agent respawned with is_finished flag. Bad UI?")
              
         return self._format_state(frame, tele), {}
 
@@ -181,20 +190,20 @@ if __name__ == "__main__":
     env = TrackmaniaEnv()
     obs, info = env.reset()
     
-    print("Rozpoczynam jazdę próbną z losowymi akcjami (Centerline Reward Mode)...")
+    print("Starting test run with random actions (Centerline Reward Mode)...")
     try:
         for step in range(200):
             random_action = env.action_space.sample() 
             obs, reward, terminated, truncated, info = env.step(random_action)
             
-            cv2.imshow("Wizja Agenta", obs["vision"])
+            cv2.imshow("Agent Vision", obs["vision"])
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
                 
-            print(f"Krok: {step:3} | Nagroda: {reward:6.2f} | Postęp: {env.last_track_index}")
+            print(f"Step: {step:3} | Reward: {reward:6.2f} | Progress: {env.last_track_index}")
             
             if terminated:
-                print("--- WYPADNIĘCIE Z TRASY - RESET ---")
+                print("--- OFF TRACK - RESET ---")
                 obs, _ = env.reset()
                 
     except KeyboardInterrupt:
