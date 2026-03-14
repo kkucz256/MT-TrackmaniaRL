@@ -49,7 +49,6 @@ class TrackmaniaPipeline:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        # Retry bind if port is in use
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -63,11 +62,9 @@ class TrackmaniaPipeline:
         
         self.sock.listen(1)
         
-        try:
-            self.conn, self.addr = self.sock.accept()
-            self.conn.settimeout(5.0)
-        except Exception as e:
-            raise
+        self.conn = None
+        self.addr = None
+        self.sock.settimeout(1.0)
         
         self.thread = threading.Thread(target=self._tcp_worker, daemon=True)
         self.thread.start()
@@ -76,36 +73,44 @@ class TrackmaniaPipeline:
         buffer = ""
         
         while self.running:
-            try:
+            if self.conn is None:
                 try:
-                    if self.conn is None:
-                        time.sleep(0.5)
-                        continue
-                    data = self.conn.recv(4096)
+                    self.conn, self.addr = self.sock.accept()
+                    self.conn.settimeout(5.0)
+                    print(f"\n[Pipeline] Caught telemetry from {self.addr}\n")
                 except socket.timeout:
                     continue
-                except (OSError, socket.error) as e:
-                    if self.running:
-                        time.sleep(0.2)
+                except Exception:
+                    time.sleep(0.5)
                     continue
-                
+            
+            try:
+                data = self.conn.recv(4096)
                 if not data:
-                    if self.running:
-                        pass
-                    time.sleep(1.0)
+                    self.conn.close()
+                    self.conn = None
                     continue
                 
-                try:
-                    buffer += data.decode('utf-8', errors='ignore')
-                    
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.strip()
-                        if line:
+                buffer += data.decode('utf-8', errors='ignore')
+                
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    if line:
+                        try:
                             self.latest_telemetry = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError) as decode_err:
-                    continue
-            except Exception as e:
+                        except json.JSONDecodeError as e:
+                            print(f"[JSON ERROR]: Data Rejected! Cause: {e} | Raw: {line}")
+                        except UnicodeDecodeError:
+                            continue
+            except socket.timeout:
+                continue
+            except (OSError, socket.error):
+                if self.conn:
+                    self.conn.close()
+                self.conn = None
+                time.sleep(0.2)
+            except Exception:
                 if self.running:
                     time.sleep(0.2)
 
@@ -127,7 +132,8 @@ class TrackmaniaPipeline:
 
     def stop(self):
         self.running = False
-        self.conn.close()
+        if self.conn:
+            self.conn.close()
         self.sock.close()
         self.camera.release()
 
@@ -147,7 +153,7 @@ if __name__ == "__main__":
                 
                 frames += 1
                 if time.time() - last_time >= 1.0:
-                    print(f"Pętla: {frames} FPS | Telemetria z gry: {tele}")
+                    print(f"Loop: {frames} FPS | Game Telemetry: {tele}")
                     frames = 0
                     last_time = time.time()
 

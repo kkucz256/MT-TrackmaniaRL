@@ -4,9 +4,6 @@ import numpy as np
 import vgamepad as vg
 import time
 import cv2
-import pandas as pd
-from scipy.spatial import KDTree
-import os
 
 from pipeline import TrackmaniaPipeline 
 
@@ -18,56 +15,16 @@ class TrackmaniaEnv(gym.Env):
         
         self.gamepad = vg.VX360Gamepad()
         
-        self.last_pos = None
+        self.last_cps = 0
         self.pause_counter = 0
-        self.pause_threshold = 10
-        
-        try:
-            track_points_path = os.path.join(os.getcwd(), "trackpoints", "track_points_training01.csv")
-            df = pd.read_csv(track_points_path, header=None)
-            self.track_points = df.values
-            self.kdtree = KDTree(self.track_points)
-            self.last_track_index = 0
-        except Exception as e:
-            print(f"[TrackmaniaEnv] Warning: Could not load track points from {track_points_path}: {e}")
-            self.track_points = np.zeros((1, 3))
-            self.kdtree = KDTree(self.track_points)
-            self.last_track_index = 0
+        self.pause_threshold = 20
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
         self.observation_space = spaces.Dict({
             "vision": spaces.Box(low=0, high=255, shape=(128, 128, 3), dtype=np.uint8),
-            "telemetry": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+            "telemetry": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
         })
-
-    def _calculate_reward(self, current_pos, current_speed):
-        dist, index = self.kdtree.query(current_pos)
-        
-        progress = index - self.last_track_index
-        if progress > 0:
-            progress_reward = 15.0 * progress
-            self.last_track_index = index
-        else:
-            progress_reward = -0.05
-        
-        if dist < 1.5:
-            track_bonus = 0.5
-        elif dist < 4.0:
-            track_bonus = 0.2
-        elif dist < 10.0:
-            track_bonus = 0.0
-        else:
-            track_bonus = -0.2
-        
-        speed_bonus = 0.0
-        if 25.0 <= current_speed <= 200.0:
-            speed_bonus = 0.3
-        elif current_speed < 5.0:
-            speed_bonus = -0.05
-            
-        total_reward = progress_reward + track_bonus + speed_bonus
-        return float(total_reward), dist
 
     def step(self, action):
         # Handle continuous action: [steering, throttle/brake]
@@ -81,12 +38,9 @@ class TrackmaniaEnv(gym.Env):
             steering = 0.0
             throttle_brake = 0.0
         
-        # Throttle: if positive
         throttle = max(0.0, throttle_brake)
-        # Brake: if negative (flip to positive)
         brake = max(0.0, -throttle_brake)
         
-        # Map to gamepad
         x_joystick = int(steering * 32767)
         self.gamepad.left_joystick(x_value=x_joystick, y_value=0)
         self.gamepad.right_trigger(value=int(throttle * 255))
@@ -98,8 +52,32 @@ class TrackmaniaEnv(gym.Env):
         frame, tele = self.pipeline.get_state()
         state = self._format_state(frame, tele)
 
-        current_pos = np.array([tele.get('pos_x', 0), tele.get('pos_y', 0), tele.get('pos_z', 0)])
-        reward, distance_to_line = self._calculate_reward(current_pos, tele.get('speed', 0))
+        cps_passed = tele.get('cps_passed', 0)
+        speed = float(tele.get('speed', 0.0))
+        slip_forward = float(tele.get('slip_forward', 0.0))
+        slip_side = float(tele.get('slip_side', 0.0))
+
+        progress_reward = 0.0
+        if cps_passed > self.last_cps:
+            progress_reward = 50.0
+            self.last_cps = cps_passed
+
+        speed_reward = 0.0
+        reverse_penalty = 0.0
+        
+        if slip_forward > 2.0:
+            # Pęd do przodu - nagroda skalująca się z prędkością
+            speed_reward = np.clip(slip_forward / 100.0, 0.0, 1.0) * 1.0
+        elif slip_forward < -2.0:
+            # Czołganie się do tyłu to teraz gwóźdź do trumny
+            reverse_penalty = -0.5
+
+        side_slip_penalty = -np.clip(abs(slip_side) / 40.0, 0.0, 1.0) * 0.2
+        idle_penalty = -0.1 if speed < 5.0 else 0.0
+
+        terminal_bonus = 0.0
+        terminal_penalty = 0.0
+        reward = progress_reward + speed_reward + reverse_penalty + side_slip_penalty + idle_penalty
 
         terminated = False
         
@@ -107,38 +85,40 @@ class TrackmaniaEnv(gym.Env):
         
         if is_finished:
             print("[ENV] FINISH LINE - REWARD: +100.0")
-            reward = 100.0
+            terminal_bonus = 100.0
+            reward += terminal_bonus
             terminated = True
-        
-        elif distance_to_line > 10.0:
-            print(f"[ENV] OFF-TRACK (dist: {distance_to_line:.2f}) - PENALTY: -0.3")
-            reward = -0.3
-            terminated = True
-        
-        speed = tele.get('speed', 0)
-        if speed < 1.0:
-            if self.last_pos is not None:
-                dist_from_last = np.linalg.norm(current_pos - self.last_pos)
-                if dist_from_last < 0.1:
-                    self.pause_counter += 1
-                    if self.pause_counter > self.pause_threshold:
-                        print(f"[ENV] PAUSE DETECTED (pause_counter: {self.pause_counter}) - PENALTY: -0.2")
-                        reward = -0.2
-                        terminated = True
-                        self.pause_counter = 0
-                else:
-                    self.pause_counter = 0
-            self.last_pos = current_pos.copy()
+
+        if speed < 2.0:
+            self.pause_counter += 1
+            if self.pause_counter > self.pause_threshold:
+                print(f"[ENV] STUCK DETECTED (pause_counter: {self.pause_counter}) - FATAL PENALTY: -20.0")
+                terminal_penalty = -20.0
+                reward += terminal_penalty
+                terminated = True
+                self.pause_counter = 0
         else:
             self.pause_counter = 0
-            self.last_pos = current_pos.copy()
 
-        return state, reward, terminated, False, {}
+        reward_info = {
+            "reward_total": float(reward),
+            "reward_progress": float(progress_reward),
+            "reward_speed": float(speed_reward),
+            "reward_side_slip_penalty": float(side_slip_penalty),
+            "reward_forward_slip_penalty": float(reverse_penalty),
+            "reward_idle_penalty": float(idle_penalty),
+            "reward_terminal_bonus": float(terminal_bonus),
+            "reward_terminal_penalty": float(terminal_penalty),
+            "speed": float(speed),
+            "cps_passed": int(cps_passed),
+        }
+
+        return state, reward, terminated, False, reward_info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        self.last_track_index = 0
+        self.last_cps = 0
         self.pause_counter = 0
         
         print("\n" + "="*60)
@@ -168,8 +148,10 @@ class TrackmaniaEnv(gym.Env):
     def _format_state(self, frame, tele):
         tele_vector = np.array([
             tele.get('speed', 0.0),
-            tele.get('pos_x', 0.0), tele.get('pos_y', 0.0), tele.get('pos_z', 0.0),
-            tele.get('vel_x', 0.0), tele.get('vel_y', 0.0), tele.get('vel_z', 0.0)
+            tele.get('gear', 0.0),
+            tele.get('rpm', 0.0),
+            tele.get('slip_forward', 0.0),
+            tele.get('slip_side', 0.0)
         ], dtype=np.float32)
         
         if frame is None:
@@ -196,7 +178,7 @@ if __name__ == "__main__":
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
                 
-            print(f"Step: {step:3} | Reward: {reward:6.2f} | Progress: {env.last_track_index}")
+            print(f"Step: {step:3} | Reward: {reward:6.2f} | CPS: {env.last_cps}")
             
             if terminated:
                 print("--- OFF TRACK - RESET ---")

@@ -63,41 +63,73 @@ def collector_worker(experience_queue, run_flag, logs_dir):
             print(f"[COLLECTOR] Creating new actor")
             actor = TmrlSacActorModule(env.observation_space, env.action_space, device="cuda", buffer_size=MEMORY_SIZE)
         
+        print("[COLLECTOR] Waiting for active telemetry connection...")
+        while run_flag.value == 1:
+            _, tele = env.pipeline.get_state()
+            if tele:
+                print(f"\n[COLLECTOR] Telemetry lock acquired! Received live signal from the game: {tele}")
+                break
+            
+            print("[COLLECTOR] No telemetry yet. Press 'Reload' in OpenPlanet (F3). Waiting...")
+            time.sleep(2.0)
+            
         print("[COLLECTOR] Ready, collecting experiences")
         
         obs, _ = env.reset()
         steps = 0
         current_ep_reward = 0.0  
-        current_ep_length = 0    # NOWE: Długość pojedynczego przejazdu
+        current_ep_length = 0
         episode_returns = []     
-        episode_lengths = []     # NOWE: Lista długości zakończonych przejazdów
+        episode_lengths = []
         last_log = time.time()
-        last_sync = time.time()  # NOWE: Śledzenie ostatniej synchronizacji wag
+        last_sync = time.time()
+        reward_component_sums = {
+            "reward_total": 0.0,
+            "reward_progress": 0.0,
+            "reward_speed": 0.0,
+            "reward_side_slip_penalty": 0.0,
+            "reward_forward_slip_penalty": 0.0,
+            "reward_idle_penalty": 0.0,
+            "reward_terminal_bonus": 0.0,
+            "reward_terminal_penalty": 0.0,
+            "speed": 0.0,
+        }
+        reward_component_count = 0
         
         while run_flag.value == 1:
             if steps < WARMUP_STEPS:
-                # Warmup phase: random actions
                 action = env.action_space.sample()
             else:
-                # Policy phase: model actions
                 action_tensor = actor.act(obs, test=False)
                 action = action_tensor.cpu().numpy().flatten()
             
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             
-            # NOWE: Synchronizacja wag co 100 kroków
             if steps % 100 == 0 and steps > 0 and os.path.exists(f"{model_path}.zip"):
                 try:
+                    old_sum = sum(p.sum().item() for p in actor.sac_model.policy.parameters())
                     actor.load(model_path)
+                    new_sum = sum(p.sum().item() for p in actor.sac_model.policy.parameters())
+                    
                     sync_elapsed = time.time() - last_sync
-                    print(f"[COLLECTOR] Synchronized weights at step {steps} (took {sync_elapsed:.3f}s)")
+                    diff = abs(new_sum - old_sum)
+                    
+                    if diff > 0:
+                        print(f"[COLLECTOR] Sync @ {steps} | Weight delta: {diff:.4f} (Success) | Time: {sync_elapsed:.3f}s")
+                    else:
+                        print(f"[COLLECTOR] Sync @ {steps} | Weight delta: 0.0000 (WARNING: Weights are identical!)")
+                        
                     last_sync = time.time()
                 except Exception as e:
                     print(f"[COLLECTOR] Failed to sync weights: {e}")
             
             current_ep_reward += reward  
-            current_ep_length += 1       # NOWE: Inkrementacja długości
+            current_ep_length += 1
+
+            for key in reward_component_sums:
+                reward_component_sums[key] += float(info.get(key, 0.0))
+            reward_component_count += 1
             
             experience = (obs, action, reward, next_obs, done)
             
@@ -107,10 +139,10 @@ def collector_worker(experience_queue, run_flag, logs_dir):
                 
                 if done:
                     episode_returns.append(current_ep_reward)
-                    episode_lengths.append(current_ep_length)  # NOWE
-                    print(f"\n[EPISODE] #{len(episode_returns)} ZAKOŃCZONY | Return: {current_ep_reward:+.2f} | Steps: {current_ep_length} | Status: {'WIN' if current_ep_reward > 50 else 'FAIL'}\n")
+                    episode_lengths.append(current_ep_length)
+                    print(f"\n[EPISODE] #{len(episode_returns)} FINISHED | Return: {current_ep_reward:+.2f} | Steps: {current_ep_length} | Status: {'WIN' if current_ep_reward > 50 else 'FAIL'}\n")
                     current_ep_reward = 0.0  
-                    current_ep_length = 0                      # NOWE
+                    current_ep_length = 0
                 
                 if time.time() - last_log >= 5.0 and len(episode_returns) > 0:
                     avg_return = np.mean(episode_returns[-50:]) if len(episode_returns) >= 1 else 0
@@ -121,6 +153,22 @@ def collector_worker(experience_queue, run_flag, logs_dir):
                     tb_writer.add_scalar('Collector/Episode_Length_Mean_50', avg_length, len(episode_returns))
                     tb_writer.add_scalar('Collector/Episode_Return_Max_50', max_return, len(episode_returns))
                     tb_writer.add_scalar('Collector/Total_Steps', steps, steps)
+
+                    if reward_component_count > 0:
+                        tb_writer.add_scalar('CollectorReward/Total_Mean', reward_component_sums['reward_total'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/Progress_Mean', reward_component_sums['reward_progress'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/Speed_Mean', reward_component_sums['reward_speed'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/SideSlipPenalty_Mean', reward_component_sums['reward_side_slip_penalty'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/ForwardSlipPenalty_Mean', reward_component_sums['reward_forward_slip_penalty'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/IdlePenalty_Mean', reward_component_sums['reward_idle_penalty'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/TerminalBonus_Mean', reward_component_sums['reward_terminal_bonus'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorReward/TerminalPenalty_Mean', reward_component_sums['reward_terminal_penalty'] / reward_component_count, steps)
+                        tb_writer.add_scalar('CollectorState/Speed_Mean', reward_component_sums['speed'] / reward_component_count, steps)
+
+                        for key in reward_component_sums:
+                            reward_component_sums[key] = 0.0
+                        reward_component_count = 0
+
                     tb_writer.flush()
                     last_log = time.time()
                     
@@ -150,7 +198,7 @@ def learner_worker(experience_queue, run_flag, logs_dir):
     try:
         observation_space = spaces.Dict({
             "vision": spaces.Box(low=0, high=255, shape=(128, 128, 3), dtype=np.uint8),
-            "telemetry": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+            "telemetry": spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
         })
         action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
@@ -173,7 +221,7 @@ def learner_worker(experience_queue, run_flag, logs_dir):
             try:
                 experiences_batch = []
                 try:
-                    for _ in range(min(10, BATCH_SIZE)):
+                    for _ in range(BATCH_SIZE):
                         exp = experience_queue.get(timeout=0.1)
                         experiences_batch.append(exp)
                         memory.append(exp)
@@ -182,7 +230,13 @@ def learner_worker(experience_queue, run_flag, logs_dir):
                 
                 if len(memory) >= TRAIN_BATCH_THRESHOLD:
                     try:
-                        training_agent.train(experiences_batch if experiences_batch else list(memory)[-BATCH_SIZE:])
+                        if len(experiences_batch) >= TRAIN_BATCH_THRESHOLD:
+                            train_batch = experiences_batch
+                        else:
+                            sample_size = min(BATCH_SIZE, len(memory))
+                            train_batch = random.sample(memory, sample_size)
+
+                        training_agent.train(train_batch)
                         batches_done += 1
                         
                         if time.time() - last_log_time >= 2.0:
@@ -207,19 +261,37 @@ def learner_worker(experience_queue, run_flag, logs_dir):
                             tb_writer.flush()
                             last_log_time = time.time()
                         
-                        if batches_done % 10 == 0:
-                            training_agent.save(model_path)
-                            print(f"[TRAINER] CHECKPOINT batch {batches_done}")
+                        if batches_done % 50 == 0:
+                            try:
+                                training_agent.save(model_path)
+                                if os.path.exists(f"{model_path}.zip"):
+                                    print(f"[TRAINER] CHECKPOINT batch {batches_done} saved successfully")
+                                else:
+                                    print(f"[TRAINER] ERROR: Model file not created at {model_path}.zip")
+                            except Exception as save_err:
+                                print(f"[TRAINER] SAVE ERROR at batch {batches_done}: {save_err}")
+                                import traceback
+                                traceback.print_exc()
                     
                     except Exception as e:
-                        print(f"[TRAINER] Train error: {e}")
+                        print(f"[TRAINER] Train error at batch {batches_done}: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
             except Exception as e:
                 print(f"[TRAINER] ERROR: {e}")
                 break
         
-        training_agent.save(model_path)
-        print(f"[TRAINER] Final checkpoint saved")
+        try:
+            training_agent.save(model_path)
+            if os.path.exists(f"{model_path}.zip"):
+                print(f"[TRAINER] Final checkpoint saved at {model_path}.zip after {batches_done} batches")
+            else:
+                print(f"[TRAINER] ERROR: Final model file not created at {model_path}.zip")
+        except Exception as final_err:
+            print(f"[TRAINER] FINAL SAVE ERROR: {final_err}")
+            import traceback
+            traceback.print_exc()
 
     except Exception as e:
         print(f"[TRAINER] FATAL INITIALIZATION: {e}")
@@ -241,7 +313,6 @@ if __name__ == "__main__":
     print(f"Resume: {RESUME_TRAINING} | Model: {MODEL_NAME}")
     print("="*80 + "\n")
     
-    # Utwórz wersjonowany katalog logów
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     logs_base_dir = "./logs"
     os.makedirs(logs_base_dir, exist_ok=True)

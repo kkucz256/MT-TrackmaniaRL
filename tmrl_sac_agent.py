@@ -14,16 +14,16 @@ class MultimodalFeaturesExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         
         self.vision_cnn = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
         )
         
-        cnn_output_size = 64 * 4 * 4
+        cnn_output_size = 9216
         telemetry_input_size = observation_space["telemetry"].shape[0]
         
         self.telemetry_mlp = nn.Sequential(
@@ -57,7 +57,6 @@ class MultimodalFeaturesExtractor(BaseFeaturesExtractor):
         vision = vision / 255.0 if vision.max() > 1.0 else vision
         
         vision_features = self.vision_cnn(vision)
-        vision_features = vision_features.reshape(vision_features.shape[0], -1)  # Flatten
         
         if telemetry.dtype != torch.float32:
             telemetry = telemetry.float()
@@ -153,7 +152,6 @@ class TmrlSacActorModule(TorchActorModule):
                 verbose=0
             )
             
-            # Ustawiamy logger, ale nie wyłączamy go - SB3 będzie zbierać metryki
             from stable_baselines3.common.logger import Logger
             self.sac_model.set_logger(Logger(folder=None, output_formats=[]))
             
@@ -224,19 +222,16 @@ class TmrlSacTrainingAgent(TrainingAgent):
                 try:
                     raw_obs, raw_action, raw_reward, raw_next_obs, raw_done = exp
 
-                    # Konwersja obs: Channel-Last (H,W,C) -> Channel-First (C,H,W) + batch dim
                     vision = np.transpose(raw_obs["vision"], (2, 0, 1))
                     vision = np.expand_dims(vision, axis=0)
                     telemetry = np.expand_dims(raw_obs["telemetry"], axis=0)
                     obs_fmt = {"vision": vision, "telemetry": telemetry}
 
-                    # Konwersja next_obs
                     next_vision = np.transpose(raw_next_obs["vision"], (2, 0, 1))
                     next_vision = np.expand_dims(next_vision, axis=0)
                     next_telemetry = np.expand_dims(raw_next_obs["telemetry"], axis=0)
                     next_obs_fmt = {"vision": next_vision, "telemetry": next_telemetry}
 
-                    # Konwersja action, reward, done
                     action_fmt = np.expand_dims(raw_action, axis=0)
                     reward_fmt = np.array([raw_reward], dtype=np.float32)
                     done_fmt = np.array([raw_done], dtype=np.float32)
