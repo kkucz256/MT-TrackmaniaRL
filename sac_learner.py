@@ -13,28 +13,32 @@ import sys
 from collections import deque
 
 from trackmania_env import TrackmaniaEnv
-from tmrl_sac_agent import TmrlSacTrainingAgent, TmrlSacActorModule
+from tmrl_sac_agent import TmrlSacTrainingAgent, TmrlSacActorModule, MODEL_SIZE_CONFIG
 from gymnasium import spaces
 from gymnasium.core import Wrapper
 from torch.utils.tensorboard import SummaryWriter
 
+#Model parameters
 GAMMA = 0.99
-LEARNING_RATE = 3e-4  # Back to 3e-4 (2e-4 was too conservative)
+LEARNING_RATE = 3e-4
+MODEL_SIZE = "Small"  # Options: "Small", "Base", "Large"
 BATCH_SIZE = 64
-TRAIN_BATCH_THRESHOLD = 16
-MEMORY_SIZE = 10000 
+TRAIN_BATCH_THRESHOLD = 1500
+MEMORY_SIZE = 50000 
 TAU = 0.005
 AUTO_ENTROPY = True
-ENT_COEF = 0.1  # Reduced back to ~default (0.2 was causing too much randomness)
-WARMUP_STEPS = 1500  # Balanced: more than 500, less than 2000
+ENT_COEF = 0.1
+WARMUP_STEPS = 1500
 
+#Training settings
 RESUME_TRAINING = False
-MODEL_NAME = "sac_model_new"
+MODEL_NAME = "model_track_01_small_200k_buf50k"
 MODEL_CHECKPOINT_DIR = "./models"
+MAX_STEPS = 200000
 
 os.makedirs(MODEL_CHECKPOINT_DIR, exist_ok=True)
 
-def collector_worker(experience_queue, run_flag, logs_dir):
+def collector_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
     print("[COLLECTOR] Starting...")
     
     collector_log_dir = os.path.join(logs_dir, "collector")
@@ -48,7 +52,6 @@ def collector_worker(experience_queue, run_flag, logs_dir):
         
         model_path = os.path.join(MODEL_CHECKPOINT_DIR, MODEL_NAME)
         
-        # Usuń stary model jeśli nie wznawiam treningu
         if not RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
             print(f"[COLLECTOR] Removing old model: {model_path}.zip")
             try:
@@ -58,10 +61,23 @@ def collector_worker(experience_queue, run_flag, logs_dir):
         
         if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
             print(f"[COLLECTOR] Loading model: {model_path}")
-            actor = TmrlSacActorModule(env.observation_space, env.action_space, device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
+            actor = TmrlSacActorModule(
+                env.observation_space,
+                env.action_space,
+                device="cuda",
+                model_path=model_path,
+                buffer_size=MEMORY_SIZE,
+                model_size=MODEL_SIZE,
+            )
         else:
             print(f"[COLLECTOR] Creating new actor")
-            actor = TmrlSacActorModule(env.observation_space, env.action_space, device="cuda", buffer_size=MEMORY_SIZE)
+            actor = TmrlSacActorModule(
+                env.observation_space,
+                env.action_space,
+                device="cuda",
+                buffer_size=MEMORY_SIZE,
+                model_size=MODEL_SIZE,
+            )
         
         print("[COLLECTOR] Waiting for active telemetry connection...")
         while run_flag.value == 1:
@@ -136,6 +152,10 @@ def collector_worker(experience_queue, run_flag, logs_dir):
             try:
                 experience_queue.put(experience, timeout=0.5)
                 steps += 1
+                if steps >= MAX_STEPS:
+                    print(f"[COLLECTOR] Reached limit MAX_STEPS ({MAX_STEPS}). Finishing training...")
+                    run_flag.value = 0
+                    break
                 
                 if done:
                     episode_returns.append(current_ep_reward)
@@ -148,7 +168,10 @@ def collector_worker(experience_queue, run_flag, logs_dir):
                     avg_return = np.mean(episode_returns[-50:]) if len(episode_returns) >= 1 else 0
                     avg_length = np.mean(episode_lengths[-50:]) if len(episode_lengths) >= 1 else 0
                     max_return = np.max(episode_returns[-50:]) if len(episode_returns) >= 1 else 0
-                    print(f"[COLLECTOR] Steps: {steps:6d} | Avg Ep Return: {avg_return:.2f} | Avg Len: {avg_length:.1f} | Max: {max_return:.2f}")
+                    print(
+                        f"[COLLECTOR] Steps: {steps:6d}"
+                        f"| Avg Ep Return: {avg_return:.2f} | Avg Len: {avg_length:.1f} | Max: {max_return:.2f}"
+                    )
                     tb_writer.add_scalar('Collector/Episode_Return_Mean_50', avg_return, len(episode_returns))
                     tb_writer.add_scalar('Collector/Episode_Length_Mean_50', avg_length, len(episode_returns))
                     tb_writer.add_scalar('Collector/Episode_Return_Max_50', max_return, len(episode_returns))
@@ -188,7 +211,7 @@ def collector_worker(experience_queue, run_flag, logs_dir):
             env.close()
         print("[COLLECTOR] Closed.")
 
-def learner_worker(experience_queue, run_flag, logs_dir):
+def learner_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
     print("[TRAINER] Starting...")
     
     learner_log_dir = os.path.join(logs_dir, "learner")
@@ -206,10 +229,23 @@ def learner_worker(experience_queue, run_flag, logs_dir):
         
         if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
             print(f"[TRAINER] Loading model: {model_path}")
-            training_agent = TmrlSacTrainingAgent(observation_space, action_space, device="cuda", model_path=model_path, buffer_size=MEMORY_SIZE)
+            training_agent = TmrlSacTrainingAgent(
+                observation_space,
+                action_space,
+                device="cuda",
+                model_path=model_path,
+                buffer_size=MEMORY_SIZE,
+                model_size=MODEL_SIZE,
+            )
         else:
             print(f"[TRAINER] Creating new training agent")
-            training_agent = TmrlSacTrainingAgent(observation_space, action_space, device="cuda", buffer_size=MEMORY_SIZE)
+            training_agent = TmrlSacTrainingAgent(
+                observation_space,
+                action_space,
+                device="cuda",
+                buffer_size=MEMORY_SIZE,
+                model_size=MODEL_SIZE,
+            )
         
         print("[TRAINER] Ready")
         
@@ -238,6 +274,7 @@ def learner_worker(experience_queue, run_flag, logs_dir):
 
                         training_agent.train(train_batch)
                         batches_done += 1
+                        learner_buffer_size.value = training_agent.actor_module.sac_model.replay_buffer.size()
                         
                         if time.time() - last_log_time >= 2.0:
                             buf_size = training_agent.actor_module.sac_model.replay_buffer.size()
@@ -309,6 +346,11 @@ if __name__ == "__main__":
     print("SAC LEARNER - TRACKMANIA")
     print("="*80)
     print(f"Learning Rate: {LEARNING_RATE} | Batch: {BATCH_SIZE} | Memory: {MEMORY_SIZE}")
+    model_cfg = MODEL_SIZE_CONFIG.get(MODEL_SIZE, {})
+    print(
+        f"Model Size: {MODEL_SIZE} | Features: {model_cfg.get('features_dim', 'n/a')} "
+        f"| Net: {model_cfg.get('net_arch', 'n/a')}"
+    )
     print(f"Gamma: {GAMMA} | Tau: {TAU} | Auto Entropy: {AUTO_ENTROPY}")
     print(f"Resume: {RESUME_TRAINING} | Model: {MODEL_NAME}")
     print("="*80 + "\n")
@@ -324,9 +366,18 @@ if __name__ == "__main__":
     
     exp_queue = mp.Queue(maxsize=2000)
     run_flag = mp.Value('i', 1)
+    learner_buffer_size = mp.Value('i', 0)
     
-    p_learner = mp.Process(target=learner_worker, args=(exp_queue, run_flag, versioned_logs_dir), daemon=False)
-    p_collector = mp.Process(target=collector_worker, args=(exp_queue, run_flag, versioned_logs_dir), daemon=False)
+    p_learner = mp.Process(
+        target=learner_worker,
+        args=(exp_queue, run_flag, versioned_logs_dir, learner_buffer_size),
+        daemon=False,
+    )
+    p_collector = mp.Process(
+        target=collector_worker,
+        args=(exp_queue, run_flag, versioned_logs_dir, learner_buffer_size),
+        daemon=False,
+    )
     
     try:
         p_learner.start()

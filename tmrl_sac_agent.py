@@ -9,42 +9,92 @@ from gymnasium import spaces
 import numpy as np
 
 
+MODEL_SIZE_CONFIG = {
+    "Small": {"features_dim": 128, "net_arch": [128, 128]},
+    "Base": {"features_dim": 256, "net_arch": [256, 256]},
+    "Large": {"features_dim": 512, "net_arch": [512, 512]},
+}
+
+
+def _normalize_model_size(model_size):
+    if model_size not in MODEL_SIZE_CONFIG:
+        raise ValueError(
+            f"Unsupported model_size '{model_size}'. Use one of: {list(MODEL_SIZE_CONFIG.keys())}"
+        )
+    return model_size
+
+
 class MultimodalFeaturesExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=256):
+    def __init__(self, observation_space, features_dim=None, model_size='Base'):
+        model_size = _normalize_model_size(model_size)
+        if features_dim is None:
+            features_dim = MODEL_SIZE_CONFIG[model_size]["features_dim"]
+
         super().__init__(observation_space, features_dim)
-        
-        self.vision_cnn = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        
-        cnn_output_size = 9216
+        self.model_size = model_size
+
+        if self.model_size == "Small":
+            self.vision_cnn = nn.Sequential(
+                nn.Conv2d(3, 16, kernel_size=8, stride=4, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, kernel_size=4, stride=2, padding=0),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            telemetry_hidden_size = 16
+        elif self.model_size == "Base":
+            self.vision_cnn = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            telemetry_hidden_size = 32
+        else:  # Large
+            self.vision_cnn = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            telemetry_hidden_size = 64
+
+        cnn_output_size = self._compute_cnn_output_size()
         telemetry_input_size = observation_space["telemetry"].shape[0]
-        
+
         self.telemetry_mlp = nn.Sequential(
-            nn.Linear(telemetry_input_size, 32),
+            nn.Linear(telemetry_input_size, telemetry_hidden_size),
             nn.ReLU(),
-            nn.Linear(32, 32),
+            nn.Linear(telemetry_hidden_size, telemetry_hidden_size),
             nn.ReLU(),
         )
-        
-        telemetry_output_size = 32
-        
+
+        telemetry_output_size = telemetry_hidden_size
+
         total_input = cnn_output_size + telemetry_output_size
-        
+
         self.fusion = nn.Sequential(
             nn.Linear(total_input, features_dim),
             nn.ReLU(),
         )
-        
+
+        print(f"[MultimodalExtractor] Model size: {self.model_size}")
         print(f"[MultimodalExtractor] Vision CNN output: {cnn_output_size}")
         print(f"[MultimodalExtractor] Telemetry MLP output: {telemetry_output_size}")
         print(f"[MultimodalExtractor] Fusion output: {features_dim}")
+
+    def _compute_cnn_output_size(self):
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, 128, 128)
+            return int(self.vision_cnn(dummy_input).shape[1])
     
     def forward(self, observations):
         vision = observations["vision"]
@@ -70,7 +120,7 @@ class MultimodalFeaturesExtractor(BaseFeaturesExtractor):
 
 class TmrlSacActorModule(TorchActorModule):
     
-    def __init__(self, observation_space, action_shape, device='cuda', model_path=None, buffer_size=10000):
+    def __init__(self, observation_space, action_shape, device='cuda', model_path=None, buffer_size=10000, model_size='Base'):
         try:
             super().__init__(observation_space, action_shape, device)
             
@@ -78,6 +128,7 @@ class TmrlSacActorModule(TorchActorModule):
             self.action_shape = action_shape
             self.device_str = device
             self.buffer_size = buffer_size
+            self.model_size = _normalize_model_size(model_size)
             
             if isinstance(observation_space, spaces.Dict):
                 self.obs_space = observation_space
@@ -132,10 +183,14 @@ class TmrlSacActorModule(TorchActorModule):
             
             dummy_env = DummyEnv(self.obs_space, self.action_space)
             
+            model_cfg = MODEL_SIZE_CONFIG[self.model_size]
             policy_kwargs = {
                 'features_extractor_class': MultimodalFeaturesExtractor,
-                'features_extractor_kwargs': {'features_dim': 256},
-                'net_arch': [256, 256],
+                'features_extractor_kwargs': {
+                    'features_dim': model_cfg['features_dim'],
+                    'model_size': self.model_size,
+                },
+                'net_arch': model_cfg['net_arch'],
             }
             
             self.sac_model = SAC(
@@ -198,11 +253,18 @@ class TmrlSacActorModule(TorchActorModule):
 
 
 class TmrlSacTrainingAgent(TrainingAgent):
-    def __init__(self, observation_space, action_shape, device='cuda', model_path=None, buffer_size=10000):
+    def __init__(self, observation_space, action_shape, device='cuda', model_path=None, buffer_size=10000, model_size='Base'):
         try:
             self.train_steps = 0
             
-            self.actor_module = TmrlSacActorModule(observation_space, action_shape, device, model_path, buffer_size)
+            self.actor_module = TmrlSacActorModule(
+                observation_space,
+                action_shape,
+                device,
+                model_path,
+                buffer_size,
+                model_size,
+            )
             
             super().__init__(self.actor_module, self.actor_module.action_space, device)
         

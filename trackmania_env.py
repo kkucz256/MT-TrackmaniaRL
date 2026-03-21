@@ -18,6 +18,8 @@ class TrackmaniaEnv(gym.Env):
         self.last_cps = 0
         self.pause_counter = 0
         self.pause_threshold = 20
+        self.frozen_rpm_counter = 0
+        self.last_seen_rpm = -1.0
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
@@ -27,10 +29,6 @@ class TrackmaniaEnv(gym.Env):
         })
 
     def step(self, action):
-        # Handle continuous action: [steering, throttle/brake]
-        # steering: [-1, 1] left to right
-        # throttle/brake: [-1, 1] where >0 is gas, <0 is brake
-        
         if isinstance(action, np.ndarray):
             steering = float(np.clip(action[0], -1.0, 1.0))
             throttle_brake = float(np.clip(action[1], -1.0, 1.0))
@@ -50,12 +48,51 @@ class TrackmaniaEnv(gym.Env):
         time.sleep(0.1)
 
         frame, tele = self.pipeline.get_state()
+        speed_for_freeze = float(tele.get('speed', 0.0))
+        rpm_for_freeze = float(tele.get('rpm', 0.0))
+        
+        if speed_for_freeze == 0.0 and rpm_for_freeze == self.last_seen_rpm:
+            self.frozen_rpm_counter += 1
+        else:
+            self.frozen_rpm_counter = 0
+        self.last_seen_rpm = rpm_for_freeze
+
+        if tele.get('is_loading', False) or self.frozen_rpm_counter > 15:
+            print("\n[ENV] Map change / scoreboard, freezing agent")
+            self.gamepad.reset()
+            self.gamepad.update()
+
+            while not tele.get('is_loading', False):
+                time.sleep(0.5)
+                _, tele = self.pipeline.get_state()
+
+            while tele.get('is_loading', False):
+                time.sleep(0.5)
+                _, tele = self.pipeline.get_state()
+
+            while float(tele.get('rpm', 0.0)) <= 10.0:
+                time.sleep(0.1)
+                _, tele = self.pipeline.get_state()
+
+            print("[ENV] Engine woke up. Hard reset\n")
+            self.frozen_rpm_counter = 0
+            frame, tele = self.pipeline.get_state()
+            self.last_seen_rpm = float(tele.get('rpm', 0.0))
+            state = self._format_state(frame, tele)
+
+            empty_info = {
+                "reward_total": 0.0, "reward_progress": 0.0, "reward_speed": 0.0,
+                "reward_side_slip_penalty": 0.0, "reward_forward_slip_penalty": 0.0,
+                "reward_idle_penalty": 0.0, "reward_terminal_bonus": 0.0,
+                "reward_terminal_penalty": 0.0, "speed": 0.0, "cps_passed": 0
+            }
+            return state, 0.0, True, False, empty_info
+
         state = self._format_state(frame, tele)
 
         cps_passed = tele.get('cps_passed', 0)
         speed = float(tele.get('speed', 0.0))
         slip_forward = float(tele.get('slip_forward', 0.0))
-        slip_side = float(tele.get('slip_side', 0.0))
 
         progress_reward = 0.0
         if cps_passed > self.last_cps:
@@ -66,13 +103,11 @@ class TrackmaniaEnv(gym.Env):
         reverse_penalty = 0.0
         
         if slip_forward > 2.0:
-            # Pęd do przodu - nagroda skalująca się z prędkością
             speed_reward = np.clip(slip_forward / 100.0, 0.0, 1.0) * 1.0
         elif slip_forward < -2.0:
-            # Czołganie się do tyłu to teraz gwóźdź do trumny
             reverse_penalty = -0.5
 
-        side_slip_penalty = -np.clip(abs(slip_side) / 40.0, 0.0, 1.0) * 0.2
+        side_slip_penalty = 0.0
         idle_penalty = -0.1 if speed < 5.0 else 0.0
 
         terminal_bonus = 0.0
@@ -80,7 +115,6 @@ class TrackmaniaEnv(gym.Env):
         reward = progress_reward + speed_reward + reverse_penalty + side_slip_penalty + idle_penalty
 
         terminated = False
-        
         is_finished = tele.get('is_finished', False)
         
         if is_finished:
@@ -115,11 +149,28 @@ class TrackmaniaEnv(gym.Env):
 
         return state, reward, terminated, False, reward_info
 
+
+    def _format_state(self, frame, tele):
+        tele_vector = np.array([
+            tele.get('speed', 0.0),
+            tele.get('gear', 0.0),
+            tele.get('rpm', 0.0),
+            tele.get('slip_forward', 0.0),
+            0.0
+        ], dtype=np.float32)
+        
+        if frame is None:
+            frame = np.zeros((128, 128, 3), dtype=np.uint8)
+            
+        return {"vision": frame, "telemetry": tele_vector}
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
         self.last_cps = 0
         self.pause_counter = 0
+        self.frozen_rpm_counter = 0
+        self.last_seen_rpm = -1.0
         
         print("\n" + "="*60)
         print("[RESET] New episode - resetting environment and respawning agent...")
@@ -144,20 +195,6 @@ class TrackmaniaEnv(gym.Env):
              print("[ENV WARN] Agent respawned with is_finished flag. Bad UI?")
              
         return self._format_state(frame, tele), {}
-
-    def _format_state(self, frame, tele):
-        tele_vector = np.array([
-            tele.get('speed', 0.0),
-            tele.get('gear', 0.0),
-            tele.get('rpm', 0.0),
-            tele.get('slip_forward', 0.0),
-            tele.get('slip_side', 0.0)
-        ], dtype=np.float32)
-        
-        if frame is None:
-            frame = np.zeros((128, 128, 3), dtype=np.uint8)
-            
-        return {"vision": frame, "telemetry": tele_vector}
 
     def close(self):
         self.pipeline.stop()
