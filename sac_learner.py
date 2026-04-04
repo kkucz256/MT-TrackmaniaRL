@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 #Model parameters
 GAMMA = 0.99
 LEARNING_RATE = 3e-4
-MODEL_SIZE = "Small"  # Options: "Small", "Base", "Large"
+MODEL_SIZE = "Large"  # Options: "Small", "Base", "Large"
 BATCH_SIZE = 64
 TRAIN_BATCH_THRESHOLD = 1500
 MEMORY_SIZE = 50000 
@@ -32,9 +32,12 @@ WARMUP_STEPS = 1500
 
 #Training settings
 RESUME_TRAINING = False
-MODEL_NAME = "model_track_01_small_200k_buf50k"
+PRETRAINED_MODEL_PATH = ""
 MODEL_CHECKPOINT_DIR = "./models"
-MAX_STEPS = 200000
+MAX_STEPS = 800000
+MODEL_NAME = f"model_mix_track_01_06{MODEL_SIZE}_{MAX_STEPS}steps_buf{MEMORY_SIZE}"
+CHECKPOINT_STEPS = 20000
+
 
 os.makedirs(MODEL_CHECKPOINT_DIR, exist_ok=True)
 
@@ -59,16 +62,36 @@ def collector_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
             except Exception as e:
                 print(f"[COLLECTOR] Failed to remove old model: {e}")
         
-        if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
-            print(f"[COLLECTOR] Loading model: {model_path}")
-            actor = TmrlSacActorModule(
-                env.observation_space,
-                env.action_space,
-                device="cuda",
-                model_path=model_path,
-                buffer_size=MEMORY_SIZE,
-                model_size=MODEL_SIZE,
-            )
+        if RESUME_TRAINING:
+            if os.path.exists(f"{model_path}.zip"):
+                print(f"[COLLECTOR] Resuming from target model: {model_path}")
+                actor = TmrlSacActorModule(
+                    env.observation_space,
+                    env.action_space,
+                    device="cuda",
+                    model_path=model_path,
+                    buffer_size=MEMORY_SIZE,
+                    model_size=MODEL_SIZE,
+                )
+            elif os.path.exists(f"{PRETRAINED_MODEL_PATH}.zip"):
+                print(f"[COLLECTOR] Loading pretrained model: {PRETRAINED_MODEL_PATH}")
+                actor = TmrlSacActorModule(
+                    env.observation_space,
+                    env.action_space,
+                    device="cuda",
+                    model_path=PRETRAINED_MODEL_PATH,
+                    buffer_size=MEMORY_SIZE,
+                    model_size=MODEL_SIZE,
+                )
+            else:
+                print("[COLLECTOR] No target or pretrained model found. Creating new actor")
+                actor = TmrlSacActorModule(
+                    env.observation_space,
+                    env.action_space,
+                    device="cuda",
+                    buffer_size=MEMORY_SIZE,
+                    model_size=MODEL_SIZE,
+                )
         else:
             print(f"[COLLECTOR] Creating new actor")
             actor = TmrlSacActorModule(
@@ -227,16 +250,36 @@ def learner_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
         
         model_path = os.path.join(MODEL_CHECKPOINT_DIR, MODEL_NAME)
         
-        if RESUME_TRAINING and os.path.exists(f"{model_path}.zip"):
-            print(f"[TRAINER] Loading model: {model_path}")
-            training_agent = TmrlSacTrainingAgent(
-                observation_space,
-                action_space,
-                device="cuda",
-                model_path=model_path,
-                buffer_size=MEMORY_SIZE,
-                model_size=MODEL_SIZE,
-            )
+        if RESUME_TRAINING:
+            if os.path.exists(f"{model_path}.zip"):
+                print(f"[TRAINER] Resuming from target model: {model_path}")
+                training_agent = TmrlSacTrainingAgent(
+                    observation_space,
+                    action_space,
+                    device="cuda",
+                    model_path=model_path,
+                    buffer_size=MEMORY_SIZE,
+                    model_size=MODEL_SIZE,
+                )
+            elif os.path.exists(f"{PRETRAINED_MODEL_PATH}.zip"):
+                print(f"[TRAINER] Loading pretrained model: {PRETRAINED_MODEL_PATH}")
+                training_agent = TmrlSacTrainingAgent(
+                    observation_space,
+                    action_space,
+                    device="cuda",
+                    model_path=PRETRAINED_MODEL_PATH,
+                    buffer_size=MEMORY_SIZE,
+                    model_size=MODEL_SIZE,
+                )
+            else:
+                print("[TRAINER] No target or pretrained model found. Creating new training agent")
+                training_agent = TmrlSacTrainingAgent(
+                    observation_space,
+                    action_space,
+                    device="cuda",
+                    buffer_size=MEMORY_SIZE,
+                    model_size=MODEL_SIZE,
+                )
         else:
             print(f"[TRAINER] Creating new training agent")
             training_agent = TmrlSacTrainingAgent(
@@ -251,6 +294,8 @@ def learner_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
         
         memory = deque(maxlen=MEMORY_SIZE)
         batches_done = 0
+        env_steps_seen = 0
+        next_checkpoint_step = CHECKPOINT_STEPS
         last_log_time = time.time()
         
         while run_flag.value == 1:
@@ -263,6 +308,8 @@ def learner_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
                         memory.append(exp)
                 except mp.queues.Empty:
                     pass
+
+                env_steps_seen += len(experiences_batch)
                 
                 if len(memory) >= TRAIN_BATCH_THRESHOLD:
                     try:
@@ -309,6 +356,21 @@ def learner_worker(experience_queue, run_flag, logs_dir, learner_buffer_size):
                                 print(f"[TRAINER] SAVE ERROR at batch {batches_done}: {save_err}")
                                 import traceback
                                 traceback.print_exc()
+
+                        while env_steps_seen >= next_checkpoint_step:
+                            try:
+                                checkpoint_model_path = f"{model_path}_steps_{next_checkpoint_step}"
+                                training_agent.save(checkpoint_model_path)
+                                if os.path.exists(f"{checkpoint_model_path}.zip"):
+                                    print(f"[TRAINER] STEP CHECKPOINT saved: {checkpoint_model_path}.zip")
+                                else:
+                                    print(f"[TRAINER] ERROR: Step checkpoint not created at {checkpoint_model_path}.zip")
+                            except Exception as save_err:
+                                print(f"[TRAINER] STEP CHECKPOINT SAVE ERROR at {next_checkpoint_step}: {save_err}")
+                                import traceback
+                                traceback.print_exc()
+
+                            next_checkpoint_step += CHECKPOINT_STEPS
                     
                     except Exception as e:
                         print(f"[TRAINER] Train error at batch {batches_done}: {e}")
@@ -352,13 +414,12 @@ if __name__ == "__main__":
         f"| Net: {model_cfg.get('net_arch', 'n/a')}"
     )
     print(f"Gamma: {GAMMA} | Tau: {TAU} | Auto Entropy: {AUTO_ENTROPY}")
+    print(f"Step checkpoint cadence: every {CHECKPOINT_STEPS} env steps")
     print(f"Resume: {RESUME_TRAINING} | Model: {MODEL_NAME}")
     print("="*80 + "\n")
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    logs_base_dir = "./logs"
-    os.makedirs(logs_base_dir, exist_ok=True)
-    versioned_logs_dir = os.path.join(logs_base_dir, timestamp)
+    versioned_logs_dir = os.path.join("./logs", MODEL_NAME, timestamp)
     os.makedirs(versioned_logs_dir, exist_ok=True)
     print(f"[MAIN] Logs saved to: {versioned_logs_dir}\n")
     

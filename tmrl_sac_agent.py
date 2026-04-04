@@ -310,7 +310,8 @@ class TmrlSacTrainingAgent(TrainingAgent):
                     print(f"[CRITICAL BUFFER ERROR]: {e}")
             
             if self.actor_module.sac_model.replay_buffer.pos > 0:
-                gradient_steps = max(1, min(len(batch) // 2, 10))
+                #gradient_steps = max(1, min(len(batch) // 2, 10))
+                gradient_steps = 1
                 try:
                     self.actor_module.sac_model.train(gradient_steps=gradient_steps)
                 except Exception as e:

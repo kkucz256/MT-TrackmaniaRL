@@ -10,12 +10,20 @@ import cv2
 from trackmania_env import TrackmaniaEnv
 from tmrl_sac_agent import TmrlSacActorModule
 
-# ==============================================================================
-# KONFIGURACJA EWALUACJI
-# ==============================================================================
-MODEL_PATH = "./models/model_track01.zip"
-MODEL_SIZE = "Base"  # Musi zgadzać się z tym, jak trenowałeś ten konkretny model!
-TEST_EPISODES = 5    # Z ilu przejazdów wyciągamy średnią (do pracy mag. daj 10-20)
+
+MODEL_PATH = os.path.join(".", "models", "model_track_01_Large_400000steps_buf50000_steps_380000.zip")
+# Set to None to rely entirely on the model stored in the .zip file.
+# Set to "Small" / "Base" / "Large" to enforce a strict compatibility check.
+MODEL_SIZE = "Large"
+TEST_EPISODES = 5
+
+
+def _get_loaded_model_size(actor):
+    try:
+        extractor = actor.sac_model.policy.features_extractor
+        return getattr(extractor, "model_size", None)
+    except Exception:
+        return None
 
 def run_evaluation():
     print("\n" + "="*80)
@@ -28,7 +36,7 @@ def run_evaluation():
 
     env = TrackmaniaEnv()
     
-    print(f"[EVAL] Ładowanie zamrożonych wag z {MODEL_PATH} (Rozmiar: {MODEL_SIZE})...")
+    print(f"[EVAL] Ładowanie zamrożonych wag z {MODEL_PATH}...")
     
     try:
         actor = TmrlSacActorModule(
@@ -50,6 +58,15 @@ def run_evaluation():
             buffer_size=1000
         )
 
+    loaded_model_size = _get_loaded_model_size(actor)
+    if MODEL_SIZE is not None and loaded_model_size is not None and MODEL_SIZE != loaded_model_size:
+        raise ValueError(
+            f"Rozjazd rozmiaru modelu: konfiguracja='{MODEL_SIZE}', model zip='{loaded_model_size}'. "
+            "Ustaw poprawny MODEL_SIZE albo MODEL_SIZE = None."
+        )
+
+    resolved_model_size = loaded_model_size if loaded_model_size is not None else (MODEL_SIZE or "Unknown")
+    print(f"[EVAL] Załadowany model ma rozmiar: {resolved_model_size}")
     print("\n[EVAL] Model załadowany. Oczekiwanie na połączenie z Trackmanią (F3 -> Reload)...")
     while True:
         _, tele = env.pipeline.get_state()
@@ -108,7 +125,7 @@ def run_evaluation():
     print("\n" + "="*80)
     print("RAPORT KOŃCOWY EWALUACJI:")
     print("="*80)
-    print(f"Model:           {MODEL_PATH} ({MODEL_SIZE})")
+    print(f"Model:           {MODEL_PATH} ({resolved_model_size})")
     print(f"Success Rate:    {success_rate:.1f}% ({len(wins)}/{TEST_EPISODES} udanych przejazdów)")
     
     if wins:
