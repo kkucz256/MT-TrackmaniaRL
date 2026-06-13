@@ -12,8 +12,6 @@ from tmrl_sac_agent import TmrlSacActorModule
 
 
 MODEL_PATH = os.path.join(".", "models/base", "model_track_01_Base_400000steps_buf50000_steps_400000.zip")
-# Set to None to rely entirely on the model stored in the .zip file.
-# Set to "Small" / "Base" / "Large" to enforce a strict compatibility check.
 MODEL_SIZE = "Large"
 TEST_EPISODES = 5
 
@@ -48,7 +46,6 @@ def run_evaluation():
             model_size=MODEL_SIZE
         )
     except TypeError:
-        # Failsafe, jeśli zapomniałeś poprawnie dodać model_size w jednym z miejsc
         print("[WARN] Actor nie przyjął model_size. Inicjalizacja bez tego parametru.")
         actor = TmrlSacActorModule(
             env.observation_space, 
