@@ -11,7 +11,7 @@ from trackmania_env import TrackmaniaEnv
 from tmrl_sac_agent import TmrlSacActorModule
 
 
-MODEL_PATH = os.path.join(".", "models", "model_track_01_Large_400000steps_buf50000_steps_380000.zip")
+MODEL_PATH = os.path.join(".", "models/base", "model_track_01_Base_400000steps_buf50000_steps_400000.zip")
 # Set to None to rely entirely on the model stored in the .zip file.
 # Set to "Small" / "Base" / "Large" to enforce a strict compatibility check.
 MODEL_SIZE = "Large"
